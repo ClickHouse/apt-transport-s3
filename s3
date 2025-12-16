@@ -320,15 +320,6 @@ cause is that you don't have IAM role on this machine")
 
     def _request(self, uri):
         uri_parsed = urllib.parse.urlparse(uri)
-        # Below if statement is to accommodate AWS guidance in regards buckets
-        # naming convention presented in
-        # https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
-        # S3 bucket names for apt repo can NOT contain '.' in the name
-        # otherwise TLS certs are broken
-        if '.' in uri_parsed.netloc:
-            raise Exception("uri should not include fully qualified domain \
- name for bucket")
-
         scheme = 'https'
         bucket = uri_parsed.netloc
         if self.path_style:
