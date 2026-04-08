@@ -53,8 +53,10 @@ usual environment variables.
 [IAM role](http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html)
 can provide credentials required for using private apt repositories.
 
-NOTE: Region MUST match the region the buckets are stored in and if not defined
-it will try to fetch it from the metadata service.
+NOTE: Region MUST match the region the buckets are stored in. If Region is not
+defined, the transport will first try to discover the bucket's region via an
+S3 `HeadBucket` request and only then fall back to the instance metadata
+service.
 
 Setting Endpoint allows for using providers other than Amazon AWS. If set, Endpoint disregards Region.
 
