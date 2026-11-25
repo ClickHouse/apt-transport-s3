@@ -45,6 +45,13 @@ TOKEN_TTL_SECONDS = 21600
 TOKEN_HEADER = "X-aws-ec2-metadata-token"
 TOKEN_HEADER_TTL = "X-aws-ec2-metadata-token-ttl-seconds"
 
+GCS_SCHEME = 'gs'
+GCS_ENDPOINT = 'https://storage.googleapis.com'
+GCE_METADATA_TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/\
+instance/service-accounts/default/token'
+GCE_TOKEN_EXPIRY_MARGIN_SECONDS = 60
+GCE_METADATA_RETRY_CODES = (429, 500, 503)
+
 
 def wait_time(c):
     return pow(2, c) - 1
@@ -492,6 +499,113 @@ Signature={}".format(
         return hashlib.sha256(payload).hexdigest()
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    Refuse to follow redirects, so that a bearer token is never replayed to
+    a host other than the one it was meant for.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class GCSCredentials(object):
+    """
+    Class for dealing with Google Cloud Storage, authenticating as the service
+    account attached to the machine. The access token is read from the GCE
+    metadata server, so no keys have to be stored on the machine.
+    """
+
+    def __init__(self):
+        self.token = None
+        self.token_expiry = 0
+        # The metadata server is link-local, it must never be reached through
+        # the proxy apt is configured with.
+        self.metadata_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+
+    def __refresh_token(self):
+        request = urllib.request.Request(
+            GCE_METADATA_TOKEN_URL,
+            headers={'Metadata-Flavor': 'Google'})
+
+        for i in range(0, RETRIES):
+            response = None
+            try:
+                response = self.metadata_opener.open(request, None, 10)
+                data = json.loads(response.read().decode('utf-8'))
+                self.token = data['access_token']
+                self.token_expiry = time.time() \
+                    + int(data.get('expires_in', 0)) \
+                    - GCE_TOKEN_EXPIRY_MARGIN_SECONDS
+                return
+            except socket.timeout:
+                time.sleep(wait_time(i + 1))
+            except urllib.error.HTTPError as e:
+                response = e
+                if e.code in GCE_METADATA_RETRY_CODES:
+                    time.sleep(wait_time(i + 1))
+                    continue
+                raise Exception(f"GCE metadata server error code: {e.code}, \
+probable cause is that you don't have a service account attached to this \
+machine")
+            except urllib.error.URLError as e:
+                if isinstance(e.reason, socket.timeout):
+                    time.sleep(wait_time(i + 1))
+                    continue
+                raise Exception(f"GCE metadata server URL error reason: \
+{e.reason}, probable cause is that this machine is not running on Google \
+Cloud")
+            finally:
+                if response:
+                    response.close()
+
+        raise Exception("GCE metadata server token request timed out")
+
+    def _token(self):
+        if self.token is None or time.time() >= self.token_expiry:
+            self.__refresh_token()
+        return self.token
+
+    def _request(self, uri):
+        uri_parsed = urllib.parse.urlparse(uri)
+        url = '{}/{}{}'.format(
+            GCS_ENDPOINT,
+            uri_parsed.netloc,
+            urllib.parse.quote(uri_parsed.path, safe='-._~/'))
+
+        request = urllib.request.Request(url)
+        request.add_header('Authorization', 'Bearer ' + self._token())
+        return request
+
+    def _open(self, uri):
+        # Proxy settings from the environment still apply to this opener
+        opener = urllib.request.build_opener(NoRedirectHandler())
+        return opener.open(self._request(uri), None, 30)
+
+    def uriopen(self, uri):
+        """uriopen(uri) open the remote file and return a file object."""
+        try:
+            try:
+                return self._open(uri)
+            except urllib.error.HTTPError as e:
+                if e.code != 401:
+                    raise
+                # The token was rejected, get a fresh one and retry once
+                e.close()
+                self.token = None
+                return self._open(uri)
+        except urllib.error.HTTPError as e:
+            # HTTPError is a "file like object" similar to what
+            # urllib.request.urlopen returns, so return it and let caller
+            # deal with the error code
+            return e
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, socket.timeout):
+                raise e.reason
+            raise Exception(f"URL error reason: {e.reason}")
+
+
 class APTMessage(object):
     MESSAGE_CODES = {
         100: 'Capabilities',
@@ -518,9 +632,12 @@ class APTMessage(object):
 class S3_method(object):
     __eof = False
 
-    def __init__(self, config_file='/etc/apt/s3auth.conf'):
-        self.iam = AWSCredentials(config_file)
-        self.iam.get_credentials()
+    def __init__(self, config_file='/etc/apt/s3auth.conf', scheme='s3'):
+        if scheme == GCS_SCHEME:
+            self.iam = GCSCredentials()
+        else:
+            self.iam = AWSCredentials(config_file)
+            self.iam.get_credentials()
         self.send_capabilities()
 
     def fail(self, message='Failed'):
@@ -630,7 +747,13 @@ class S3_method(object):
         code = error.find('Code')
         message = error.find('Message')
         if code is not None and message is not None:
-            return '[{}] {}'.format(code.text, message.text)
+            result = '[{}] {}'.format(code.text, message.text)
+            # Google Cloud Storage puts the actual cause (missing IAM
+            # permission, insufficient access scopes) in a Details element
+            details = error.find('Details')
+            if details is not None and details.text:
+                result += ' ({})'.format(details.text)
+            return result
 
         # fallback to returning an empty string
         return ''
@@ -733,7 +856,9 @@ if __name__ == '__main__':
         config = '/etc/apt/s3auth.conf'
         if len(sys.argv) == 2 and os.path.isfile(sys.argv[1]):
             config = sys.argv[1]
-        method = S3_method(config)
+        # apt runs the method under the name of the URI scheme, the same
+        # script serves gs:// when installed (or symlinked) as 'gs'
+        method = S3_method(config, os.path.basename(sys.argv[0]))
         ret = method.run()
         sys.exit(ret)
     except KeyboardInterrupt:
