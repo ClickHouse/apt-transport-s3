@@ -5,6 +5,9 @@ Allow to have a privately hosted apt repository on S3. Access keys are read from
 access to AWS metadata server on 169.254.169.254.  They are also taken from the
 usual environment variables.
 
+Repositories hosted on Google Cloud Storage are supported as well, through
+`gs://` URIs, see [Google Cloud Storage](#google-cloud-storage).
+
 [License and Copyright]: #license--copyright
 [Requirements]: #requirements
 [Configuration]: #configuration
@@ -92,12 +95,34 @@ PathStyle       = True
 }
 ```
 
+### Google Cloud Storage
+
+`gs://` URIs are fetched from Google Cloud Storage as the service account
+attached to the machine. The access token is read from the GCE metadata
+server, so there are no keys to configure and `/etc/apt/s3auth.conf` is not
+used.
+
+Requirements:
+
+1. The method has to be installed under the `gs` name as well, apt picks the
+   method by URI scheme:
+   `ln -s s3 /usr/lib/apt/methods/gs`
+2. The service account needs `storage.objects.get` on the bucket, for example
+   `roles/storage.objectViewer` granted on the bucket. The bucket may live in
+   another project, the grant is made on the bucket only.
+3. The access scopes of the VM have to allow reading from Cloud Storage
+   (`devstorage.read_only` or `cloud-platform`).
+
 ## Usage
 
 Install the .deb package from the releases page.  The bucket repo should be
 specified using an s3:// prefix, for example:
 
 `deb s3://aptbucketname/repo/ trusty main contrib non-free`
+
+or, for a bucket on Google Cloud Storage:
+
+`deb gs://aptbucketname/repo/ trusty main contrib non-free`
 
 if you need to use a proxy to connect to the internet you can specify this
 as an APT configuration directive (for example in
